@@ -1,0 +1,516 @@
+devtools::install_github("statsbomb/SDMTools", force = TRUE)
+library(SDMTools)
+devtools::install_github("statsbomb/StatsBombR", force = TRUE)
+library(StatsBombR)
+library(soccermatics)
+library(dplyr)
+library(grid)
+library(splancs)
+library(ggplot2)
+library(ggrepel)
+library(readr)
+library(scales)
+library(devtools)
+library(soccermatics)
+library(dplyr)
+library(openxlsx)
+install.packages("matrixLaplacian")
+library(matrixLaplacian)
+library(Rteta)
+library(soccermatics)
+library(readxl)
+library(ggsoccer)
+
+
+
+M <- 12 #width
+N <- 16 #length
+
+get_cell_indexes <- function(x, y, l, w)
+{
+  
+  xmin = 0
+  ymin = 0
+  
+  xi = (x - xmin) / 105.0 * l
+  yj = (y - ymin) / 68.0 * w
+  xi <- ceiling(pmax(pmin(xi, l), 1))
+  yj <- ceiling(pmax(pmin(yj, w), 1))
+  
+  return(list(xi, yj))
+}
+
+get_flat_indexes <- function(x,y,l,w)
+{
+  output <- c()
+  indexes <- get_cell_indexes(x, y, l, w)
+  
+  for(i in 1:length(indexes[[1]]))
+  {
+    output <- append(output, w - indexes[[2]][i] + 1 + (12 * (indexes[[1]][i] - 1)))
+  }
+  
+  return(output)
+}
+
+
+count <- function(x,y,l,w)
+{
+  x = x[is.na(x) == FALSE & is.na(y) == FALSE]
+  y = y[is.na(x) == FALSE & is.na(y) == FALSE]
+  
+  flat_indexes = get_flat_indexes(x, y, l, w)
+  vn <- table(flat_indexes)
+  
+  vector <- rep(0, l*w)
+  
+  for(i in 1:(l*w))
+  {
+    if(as.character(i) %in% names(vn))
+    {
+      vector[i] <- vn[[as.character(i)]]
+    }
+  }
+  
+  
+  return(matrix(data = vector, nrow = w, ncol = l))
+}
+
+safe_divide <- function(a,b)
+{
+  output <- a/b
+  output[which(is.nan(output))] <- 0
+  return(output)
+}
+
+
+scoring_prob <- function(actions, l, w)
+{
+  shot_actions = actions[which(actions$type_name == "shot"),]
+  goals = shot_actions[which(shot_actions$result_name == "success"),]
+  
+  shotmatrix = count(shot_actions$start_x, shot_actions$start_y, l, w)
+  goalmatrix = count(goals$start_x, goals$start_y, l, w)
+  
+  return(safe_divide(goalmatrix, shotmatrix))
+}
+
+get_move_actions <- function(actions)
+{
+  return(actions[which(actions$type_name == "pass" | 
+                         actions$type_name == "dribble" |
+                         actions$type_name == "cross"),])
+}
+
+
+action_prob <- function(actions, l, w)
+{
+  move_actions = get_move_actions(actions)
+  shot_actions = actions[which(actions$type_name == "shot"),]
+  
+  movematrix = count(move_actions$start_x, move_actions$start_y, l, w)
+  shotmatrix = count(shot_actions$start_x, shot_actions$start_y, l, w)
+  totalmatrix = movematrix + shotmatrix
+  
+  return(list(safe_divide(shotmatrix, totalmatrix), safe_divide(movematrix, totalmatrix)))
+}
+
+
+move_transition_matrix <- function(actions, l, w)
+{
+  move_actions = get_move_actions(actions)
+  move_actions <- subset(move_actions, is.na(end_x) == FALSE & is.na(result_name) == FALSE)
+  
+  X = data.frame("start_cell" = get_flat_indexes(move_actions$start_x, move_actions$start_y, l, w),
+                 "end_cell" = get_flat_indexes(move_actions$end_x, move_actions$end_y, l, w),
+                 "result_name" = move_actions$result_name)
+  
+  vc = as.vector(table(X$start_cell))
+  
+  transition_matrix = matrix(data = rep(0,w * l * w * l), ncol = w * l, nrow = w * l)
+  
+  for (i in 1:(w * l))
+  {
+    vc2 = table(X[which(X$start_cell == i & X$result_name == "success"),]$end_cell)
+    
+    
+    for(j in 1:length(names(vc2)))
+    {
+      transition_matrix[i, as.numeric(names(vc2)[j])] = vc2[j] / vc[i]
+    }
+  }
+  
+  return(transition_matrix)
+}
+
+
+setClass("expectedThreat", slots=list(l="numeric", w="numeric", eps="numeric", heatmaps="list", xT="matrix",
+                                      scoring_prob_matrix="matrix", shot_prob_matrix="matrix",
+                                      move_prob_matrix="matrix", transition_matrix="matrix"))
+
+
+expectedThreat <- function(l, w, eps)
+{
+  setClass("expectedThreat", slots=list(l="numeric", w="numeric", eps="numeric", heatmaps="list", xT="matrix",
+                                        scoring_prob_matrix="matrix", shot_prob_matrix="matrix",
+                                        move_prob_matrix="matrix", transition_matrix="matrix"))
+  
+  output <- new("expectedThreat", l=l, w=w, eps=eps, heatmaps=list(), xT=matrix(data=rep(0,w*l), nrow = w, ncol = l),
+                scoring_prob_matrix = matrix(data=rep(0,w*l), nrow = w, ncol = l), 
+                shot_prob_matrix = matrix(data=rep(0,w*l), nrow = w, ncol = l),
+                move_prob_matrix = matrix(data=rep(0,w*l), nrow = w, ncol = l),
+                transition_matrix = matrix(data=rep(0,w*l), nrow = w * l, ncol = w * l))
+  
+  return(output)
+}
+
+
+solve <- function(self, p_scoring, p_shot, p_move, transition_matrix, iter_max)
+{
+  gs = p_scoring * p_shot
+  diff = 1
+  it = 0
+  self@heatmaps <- append(self@heatmaps, self@xT)
+  
+  while (TRUE %in% as.vector(diff > self@eps) & it < iter_max)
+  {  
+    total_payoff <- matrix(data = rep(0, self@w * self@l), nrow = self@w, ncol = self@l)
+    
+    for (y in 1:self@w)
+    {
+      for (x in 1:self@l)
+      {
+        for (q in 1:self@w)
+        {
+          for (z in 1:self@l)
+          {
+            total_payoff[y,x] <- total_payoff[y,x] + (transition_matrix[y + (12 * (x - 1)), q + (12 * (z - 1))]* self@xT[q, z])
+          }
+        }
+      }
+    }
+    
+    newxT = gs + (p_move * total_payoff)
+    newxT[is.na(newxT)] <- 0
+    diff = newxT - self@xT
+    self@xT = newxT
+    self@heatmaps <- append(self@heatmaps, self@xT)
+    it <- it + 1
+  }
+  
+  print(sprintf("# iterations: %s", it))
+  return(self)
+}
+
+fit <- function(self, actions, iter_max)
+{
+  self@scoring_prob_matrix <- scoring_prob(actions, self@l, self@w)
+  
+  tempList <- action_prob(actions, self@l, self@w)
+  self@shot_prob_matrix <- tempList[[1]]
+  self@move_prob_matrix <- tempList[[2]]
+  
+  self@transition_matrix = move_transition_matrix(actions, self@l, self@w)
+  
+  self <- solve(self, self@scoring_prob_matrix, self@shot_prob_matrix, self@move_prob_matrix,
+                self@transition_matrix, 5)
+  
+  return(self)
+}
+
+
+interpolator <- function(self)
+{
+  library(akima) 
+  
+  cell_length = 105.0 / self@l
+  cell_width = 68.0 / self@w
+  
+  x <- seq(from = 0.0, to = 105.0, length.out = 192) + 0.5 * cell_length
+  y <- seq(from = 0.0, to = 68.0, length.out = 192) + 0.5 * cell_width
+  
+  result <- interp(x=x, y=y, z=self@xT, xo = seq(min(x),max(x), length.out = 680), yo = seq(min(y), max(y)
+                                                                                            , length.out = 1050),linear = FALSE, extrap = TRUE)
+  
+  return(result[[3]])
+}
+
+predict <- function(self, actions, use_interpolation = TRUE)
+{
+  if(use_interpolation == FALSE)
+  {
+    l = self@l
+    w = self@w
+    grid = self@xT
+  }else
+  {
+    l = 1050
+    w = 680
+    grid = interpolator(self)
+  }
+  
+  start <- get_cell_indexes(actions$start_x, actions$start_y, l, w)
+  end <- get_cell_indexes(actions$end_x, actions$end_y, l, w)
+  
+  xT_start <- c()
+  xT_end <- c()
+  
+  for(i in 1:length(start[[2]]))
+  {
+    xT_start <- append(xT_start, grid[w + 1 - start[[2]][i], start[[1]][i]])
+    xT_end <- append(xT_end, grid[w + 1 - end[[2]][i], end[[1]][i]])
+  }
+  
+  return(xT_end - xT_start)
+}
+
+
+competitions <- FreeCompetitions()
+View(competitions)
+
+copa2022 <- FreeCompetitions()%>%
+  filter(competition_id == 43 & season_id == 106)
+
+matches <- FreeMatches(Competitions = copa2022)
+View(matches)
+
+events <- free_allevents(MatchesDF = matches, Parallel = T)
+
+cleanevents = allclean(events)
+
+AllArgentinaMatches = events %>%
+  filter(team.name == "Argentina")
+View(AllArgentinaMatches)
+
+data <- sb_convert_spadl(events)
+test <- subset(data,  is.na(end_x) == FALSE)
+train <- subset(data)
+obj <- expectedThreat(l = N, w = M, eps = 1e-5)
+obj <- fit(obj, train)
+predicted <- predict(obj, test, use_interpolation = FALSE)
+
+actionstotal <- data.frame(test, "xThreat" = round(predicted,3))
+
+summary <- actionstotal %>%
+  group_by(player_name)%>%
+  dplyr::summarise("xT" = sum(xThreat, na.rm = TRUE))
+
+View(summary)
+
+summaryxT <- actionstotal %>%
+  filter(team_name == "Argentina")%>%
+  group_by(player_name)%>%
+  dplyr::summarise("xT" = sum(xThreat, na.rm = TRUE))
+
+View(summaryxT)
+
+JogadoresArg <- c("Messi", "Di María", "De Paul", "Acuna", "Enzo Fernandez", "Julián Álvarez", "Lautaro Martínez", "Molina")
+xT <- c(9.410, 4.139, 3.530, 2.703, 2.651, 2.267, 1.673, 1.326)
+index <- 1:8
+Argentina_xT <- as.data.frame(cbind(index, JogadoresArg, xT))
+Argentina_xT$index <- as.numeric(Argentina_xT$index)
+Argentina_xT$xT <- as.numeric(Argentina_xT$xT)
+Argentina_xT$JogadoresArg <- factor(Argentina_xT$JogadoresArg)
+
+ggplot(data = Argentina_xT, aes(x = reorder(JogadoresArg, xT), y
+                                = xT, label= xT, fill = JogadoresArg)) +
+  # add the bar/pizza slices that are colored
+  geom_bar(data = Argentina_xT, width = 1,
+           color = "oldlace",
+           stat = "identity") + labs(title = " xG
+dos avançados das grandes 5 ligas",
+                                     subtitle = "
+@josemrc92", x = NULL, y = NULL)
+
+
+ggplot(data = Argentina_xT, aes(x = reorder(JogadoresArg, xT), y = xT,
+                                label= xT, fill = JogadoresArg)) +
+  # add the bar/pizza slices that are colored
+  geom_bar(data = Argentina_xT, width = 1,
+           color = "oldlace",
+           stat = "identity") +
+  # wrap bar chart as around polar center
+  coord_polar() + labs(title = " xT Argentina",
+                       subtitle = " World Cup 2022",
+                       x = NULL, y = NULL)
+
+install.packages("DescTools")
+library(DescTools)
+Argentina <- c(9.410,4.139, 3.530, 2.703, 2.651, 2.267, 1.673, 1.326, 0.944, 0.758, 0.685, 0.631, 0.549, 0.494, 0.406, 0.340, 0.319, 0.215, 0.129, 0.093,0.084,0.082,0.021,0.001)
+Gini(Argentina, unbiased=FALSE)
+
+jogadores = unique(AllArgentinaMatches$player.id, na.rm = FALSE)
+
+jogadores
+
+fornecedores = AllArgentinaMatches$player.id
+receptores = AllArgentinaMatches$pass.recipient.id
+
+matriz = matrix(NA, nrow = length(jogadores), ncol = length(jogadores))
+
+for(i in 1:length(jogadores)){
+  for(j in 1:length(jogadores)){
+    matriz[i,j] = length(which(fornecedores == jogadores[i] & receptores == jogadores[j]))
+  }
+}
+matriz
+View(matriz)
+
+e <- eigen(matriz)
+e$values
+
+lap <- matrixLaplacian(matriz, plot2D=TRUE, plot3D=TRUE)
+eigen(lap$LaplacianMatrix)
+
+
+AllFranceMatches = cleanevents %>%
+  filter(team.name == "France")
+View(AllFranceMatches)
+
+jogadores2 = unique(AllFranceMatches$player.id, na.rm = FALSE)
+
+jogadores2
+
+fornecedores2 = AllFranceMatches$player.id
+receptores2 = AllFranceMatches$pass.recipient.id
+
+matriz2 = matrix(NA, nrow = length(jogadores2), ncol = length(jogadores2))
+
+for(i in 1:length(jogadores2)){
+  for(j in 1:length(jogadores2)){
+    matriz2[i,j] = length(which(fornecedores2 == jogadores2[i] & receptores2 == jogadores2[j]))
+  }
+}
+
+View(matriz2)
+
+e2 <- eigen(matriz2)
+e2$values
+
+lap <- matrixLaplacian(matriz, plot2D=TRUE, plot3D=TRUE)
+eigen(lap$LaplacianMatrix)
+
+#Defensive Actions
+
+ArgentinaData <- sb_convert_spadl(AllArgentinaMatches)
+DePaul <- c("Rodrigo Javier De Paul")
+Argentina1 <- c("Argentina")
+Defensive_Actions <- c("tackle", "clearance", "interception")
+DePaul_def_data <- subset(ArgentinaData, player_name == DePaul & type_name %in% Defensive_Actions)
+
+gramado <- soccerPitch(theme = "grass")
+DePaul_def_data$end_x <- as.numeric(DePaul_def_data$end_x)
+DePaul_def_data$end_y <- as.numeric(DePaul_def_data$end_y)
+
+gramado + geom_point(data=DePaul_def_data, mapping = aes(x=end_x,y=end_y, colour = factor(type_name)), size=3)
+
+Enzo <- c("Enzo Jeremías Fernández")
+Enzo_def_data <- subset(ArgentinaData, player_name == Enzo & type_name %in% Defensive_Actions)
+Enzo_def_data$end_x <- as.numeric(Enzo_def_data$end_x)
+Enzo_def_data$end_y <- as.numeric(Enzo_def_data$end_y)
+gramado + geom_point(data=Enzo_def_data, mapping = aes(x=end_x,y=end_y, colour = factor(type_name)), size=3)
+
+
+#Recorrido e Mapa de calor
+
+RodridePaul <- ArgentinaData %>%
+  filter(player_name == DePaul)
+
+RodridePaul$end_x <- as.numeric(RodridePaul$end_x)
+RodridePaul$end_y <- as.numeric(RodridePaul$end_y)
+RodridePaul <- as.data.frame(RodridePaul)
+
+soccerPitch(lengthPitch=105, widthPitch=68, theme = "grass", title
+            = "Rodri de Paul PathMap", subtitle = "World Cup 2022",) +
+  geom_path(data = RodridePaul, aes(end_x, end_y), col ="yellow",
+            lwd = 1)
+
+
+soccerHeatmap(RodridePaul, lengthPitch = 105, widthPitch = 68, xBins = 10,
+              yBins = 10, kde = FALSE, arrow = c("r"),
+              colLow = "white", colHigh = "red", title = "Rodri de Paul HeatMap", subtitle = "WC 2022",
+              x = "end_x", y = "end_y")
+
+#dribles messi
+
+
+drib_HomeTeam <- filter(ArgentinaData, type_name == "dribble", player_name == "Lionel Andrés Messi Cuccittini")
+drib_HomeTeam$end_x <- as.numeric(drib_HomeTeam$end_x)
+drib_HomeTeam$end_y <- as.numeric(drib_HomeTeam$end_y)
+drib_HomeTeam <- as.data.frame(drib_HomeTeam)
+
+Shape_dribbles <- c("success"=18,"fail"=4)
+Color_dribbles <- c("success"="green","fail"="red")
+
+soccerPitch(theme = "grass", arrow = "r", title = "World Cup 2022", subtitle = "Messi DribbleMap") + 
+  geom_point(data = drib_HomeTeam, aes(x=end_x,y=end_y, colour = factor(result_name), shape= factor(result_name)), size=5) +
+  scale_shape_manual(values = Shape_dribbles) + 
+  scale_color_manual(values = Color_dribbles) +
+  geom_label_repel(data=drib_HomeTeam, box.padding = 0.25, label.padding = 0.1, aes(x=end_x,y=end_y, label=player_name)) +
+  theme(legend.position = "none")
+
+library(ggConvexHull)
+library(ggnetwork)
+library(ggforce)
+
+#Vamos criar agora o mapa de posiçao media dos times.
+
+ArgentinaData$end_x <- as.numeric(ArgentinaData$end_x)
+ArgentinaData$end_y <- as.numeric(ArgentinaData$end_y)
+ArgentinaData <- as.data.frame(ArgentinaData)
+
+
+soccerPositionMap(ArgentinaData, lengthPitch = 105, widthPitch = 68, theme
+                  = "grass", fill1 = "cadetblue1", col1 = "white", fill2 = "black", arrow =
+                    "r", title = "World Cup 2022", subtitle = "Argentina Possition Map", x = "end_x", y = "end_y", id = "player_name")
+
+#Passes
+
+Passes_Arg <- ArgentinaData %>%
+  filter(type_name == "pass" , player_name == "Enzo Jeremías Fernández")
+
+Passes_Arg$start_x <- as.numeric(Passes_Arg$start_x)
+Passes_Arg$start_y <- as.numeric(Passes_Arg$start_y)
+Passes_Arg <- as.data.frame(Passes_Arg)
+Shape_Passes <- c("success"=18,"fail"=4)
+Color_Passes <- c("success"="green","fail"="red")
+soccerPitch(theme = "grass", arrow = "r", title = "Argentina PassMap", subtitle = "World Cup") +
+  geom_point(data=Passes_Arg, aes(x=start_x,y=start_y, colour =
+                                     factor(result_name), shape= factor(result_name)), size=5) +
+  scale_shape_manual(values = Shape_Passes) +
+  scale_color_manual(values = Color_Passes) + theme(legend.position =
+                                                      "none")
+
+cleanevents %>%
+  filter(team.name == "Argentina", match_id == 3857264) %>%
+  soccerPassmap(fill = "lightblue", arrow = "r", title = "Argentina")
+
+library(ggplot2)
+library(plyr)
+library(reshape2)
+library(scales)
+library(readr)
+
+ChutesArg <- read_excel("C:/Users/tinpa/Downloads/criaçãobom (1).xlsx")
+View(ChutesArg)
+CHU <- melt(ChutesArg)
+CHU <- ddply(CHU, .(variable), transform, rescale =
+               scale(value))
+ggplot(CHU, aes(variable, Player)) + geom_tile(aes(fill = rescale),
+                                                colour = "white") + scale_fill_gradient(low = "white", high = "red")
+Grafica <- ggplot(CHU, aes(variable, Player)) + geom_tile(aes(fill =
+                                                                 rescale), colour = "white") + scale_fill_gradient(low = "white", high
+                                                                                                                   = "black")
+Grafica + labs(x = "", y = "") +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_y_discrete(expand = c(0, 0)) +
+  theme(legend.position = "none", axis.ticks = element_blank())
+
+PasseArg <- read_excel("C:/Users/tinpa/Downloads/passebom.xlsx")
+View(PasseArg)
+PASS <- melt(PasseArg)
+PASS <- ddply(PASS, .(variable), transform, rescale =
+               scale(value))
+ggplot(PASS, aes(variable, Player)) + geom_tile(aes(fill = rescale),
+                                               colour = "white") + scale_fill_gradient(low = "white", high = "red")
+
